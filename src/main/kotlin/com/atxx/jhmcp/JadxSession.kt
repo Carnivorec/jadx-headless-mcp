@@ -87,19 +87,12 @@ class JadxSession private constructor(
 
     /**
      * Every class INCLUDING nested/inner ones. jadx's `decompiler.classes` returns only top-level
-     * classes; inner classes (and Kotlin `$Companion`) are reachable solely via `getInnerClasses()`.
-     * Flattening them here is what makes `Outer$Companion` / `Outer.Inner` addressable by name.
+     * classes; `classesWithInners` includes nested classes without decompiling them. Keep only
+     * classes whose original top-level parent passed the package filter.
      */
     val allClasses: List<JavaClass> by lazy {
-        val out = ArrayList<JavaClass>(classes.size + classes.size / 4)
-        val stack = ArrayDeque(classes)
-        while (stack.isNotEmpty()) {
-            val c = stack.removeLast()
-            out += c
-            val inners = runCatching { c.innerClasses }.getOrNull()
-            if (!inners.isNullOrEmpty()) stack.addAll(inners)
-        }
-        out
+        val keptTopClasses = classes.map { it.classNode }.toSet()
+        decompiler.classesWithInners.filter { it.classNode.topParentClass in keptTopClasses }
     }
 
     private val classByFqn: Map<String, JavaClass> by lazy {
@@ -125,16 +118,25 @@ class JadxSession private constructor(
         map
     }
 
-    private val methodsByName: Map<String, List<JavaMethod>> by lazy {
-        val map = HashMap<String, MutableList<JavaMethod>>(allClasses.size * 4)
+    private val methodsByName: Map<String, List<JavaClass>> by lazy {
+        val map = HashMap<String, MutableList<JavaClass>>(allClasses.size * 4)
         for (cls in allClasses) {
-            val methods = runCatching { cls.methods }.getOrNull() ?: continue
-            for (m in methods) {
-                map.getOrPut(m.name) { mutableListOf() }.add(m)
+            for (name in methodsOf(cls).map { it.name }.distinct()) {
+                map.getOrPut(name) { mutableListOf() }.add(cls)
             }
         }
         map
     }
+
+    fun methodsOf(cls: JavaClass): List<JavaMethod> =
+        cls.classNode.methods.map { decompiler.getJavaNodeByRef(it) as JavaMethod }
+            .sortedWith(compareBy<JavaMethod> { it.name }.thenBy { it.methodNode.methodInfo.shortId })
+
+    fun fieldsOf(cls: JavaClass): List<JavaField> =
+        cls.classNode.fields.map { decompiler.getJavaNodeByRef(it) as JavaField }
+
+    fun innerClassesOf(cls: JavaClass): List<JavaClass> =
+        cls.classNode.innerClasses.map { decompiler.getJavaNodeByRef(it) as JavaClass }
 
     /** Exact match on the dotted FQN only (legacy behaviour). Prefer [resolveClass]. */
     fun findClass(fqn: String): JavaClass? = classByFqn[fqn]
@@ -179,7 +181,7 @@ class JadxSession private constructor(
 
     /** Inner classes of [cls] with both dotted and raw (`$`) forms so callers can copy an addressable name. */
     fun innerClasses(cls: JavaClass): List<Map<String, Any>> =
-        cls.innerClasses.map {
+        innerClassesOf(cls).map {
             mapOf(
                 "full_name" to it.fullName,
                 "raw_name" to it.rawName,
@@ -244,10 +246,10 @@ class JadxSession private constructor(
             if (SearchScope.CLASS in scopes && cls.fullName.lowercase().contains(kw)) {
                 matched += SearchScope.CLASS
             }
-            if (SearchScope.METHOD in scopes && cls.methods.any { it.name.lowercase().contains(kw) }) {
+            if (SearchScope.METHOD in scopes && methodsOf(cls).any { it.name.lowercase().contains(kw) }) {
                 matched += SearchScope.METHOD
             }
-            if (SearchScope.FIELD in scopes && cls.fields.any { it.name.lowercase().contains(kw) }) {
+            if (SearchScope.FIELD in scopes && fieldsOf(cls).any { it.name.lowercase().contains(kw) }) {
                 matched += SearchScope.FIELD
             }
             // CODE only on top-level classes: jadx inlines inner-class source into the outer class's
@@ -287,29 +289,34 @@ class JadxSession private constructor(
 
     fun searchMethods(name: String, limit: Int): List<JavaMethod> {
         val exact = methodsByName[name]
-        if (!exact.isNullOrEmpty()) return exact.take(limit)
+        if (!exact.isNullOrEmpty()) return exact.asSequence()
+            .flatMap { methodsOf(it).asSequence().filter { method -> method.name == name } }
+            .take(limit)
+            .toList()
         val kw = name.lowercase()
         return methodsByName.entries.asSequence()
             .filter { it.key.lowercase().contains(kw) }
-            .flatMap { it.value.asSequence() }
+            .flatMap { (methodName, owners) ->
+                owners.asSequence().flatMap { methodsOf(it).asSequence().filter { method -> method.name == methodName } }
+            }
             .take(limit)
             .toList()
     }
 
     fun findMethod(classFqn: String, methodName: String): JavaMethod? {
         val cls = resolveClass(classFqn) ?: return null
-        return cls.methods.firstOrNull { it.name == methodName }
+        return methodsOf(cls).firstOrNull { it.name == methodName }
     }
 
     /** All methods matching [methodName] in the class (handles overloads). */
     fun findMethods(classFqn: String, methodName: String): List<JavaMethod> {
         val cls = resolveClass(classFqn) ?: return emptyList()
-        return cls.methods.filter { it.name == methodName }
+        return methodsOf(cls).filter { it.name == methodName }
     }
 
     fun findField(classFqn: String, fieldName: String): JavaField? {
         val cls = resolveClass(classFqn) ?: return null
-        return cls.fields.firstOrNull { it.name == fieldName }
+        return fieldsOf(cls).firstOrNull { it.name == fieldName }
     }
 
     fun getClassSource(cls: JavaClass, maxBytes: Int = maxSourceBytes): String {
@@ -495,8 +502,8 @@ class JadxSession private constructor(
     }
 
     private fun decompileErrorBanner(cls: JavaClass, kind: String, err: Throwable): String {
-        val methods = runCatching { cls.methods.size }.getOrDefault(-1)
-        val fields = runCatching { cls.fields.size }.getOrDefault(-1)
+        val methods = methodsOf(cls).size
+        val fields = fieldsOf(cls).size
         return buildString {
             appendLine("// ERROR: jadx $kind failed for ${cls.fullName}")
             appendLine("// reason: ${err.message ?: err.javaClass.simpleName}")
@@ -506,62 +513,35 @@ class JadxSession private constructor(
         }
     }
 
-    /**
-     * Class skeleton without method/field bodies.
-     * Note: jadx's `JavaClass.getMethods()`/`getFields()` can force full decompile on some
-     * builds (especially control-flow-obfuscated classes). We still wrap with the hard timeout
-     * so summary cannot hang MCP for hours.
-     */
+    /** Class skeleton from metadata, without decompilation or method/field bodies. */
     fun summarizeClass(cls: JavaClass): Map<String, Any> {
-        val skeleton = decompileTimed(cls.fullName, "summary", decompileTimeoutMs) {
-            val methods = cls.methods.map { m ->
-                mapOf(
-                    "name" to m.name,
-                    "signature" to buildString {
-                        append(m.name)
-                        append('(')
-                        append(m.arguments.joinToString(", ") { shortType(it.toString()) })
-                        append(')')
-                        append(": ")
-                        append(shortType(m.returnType.toString()))
-                    },
-                    "is_constructor" to m.isConstructor,
-                    "def_pos" to m.defPos,
-                )
-            }
-            val fields = cls.fields.map { f ->
-                mapOf(
-                    "name" to f.name,
-                    "type" to shortType(f.type.toString()),
-                    "def_pos" to f.defPos,
-                )
-            }
+        val methods = methodsOf(cls).map { method ->
             mapOf(
-                "full_name" to cls.fullName,
-                "name" to cls.name,
-                "method_count" to methods.size,
-                "field_count" to fields.size,
-                "inner_class_count" to cls.innerClasses.size,
-                "methods" to methods,
-                "fields" to fields,
-                "inner_classes" to cls.innerClasses.map { it.fullName },
+                "name" to method.name,
+                "short_id" to method.methodNode.methodInfo.shortId,
+                "signature" to methodSignature(method),
+                "is_constructor" to method.isConstructor,
+                "def_pos" to method.defPos,
             )
         }
-        val result = skeleton.getOrElse { err ->
+        val fields = fieldsOf(cls).map { field ->
             mapOf(
-                "full_name" to cls.fullName,
-                "name" to cls.name,
-                "error" to (err.message ?: err.javaClass.simpleName),
-                "method_count" to -1,
-                "field_count" to -1,
-                "methods" to emptyList<Any>(),
-                "fields" to emptyList<Any>(),
-                "inner_classes" to emptyList<Any>(),
-                "hint" to "summary timed out — class likely control-flow obfuscated; try search_method_by_name / DEX strings",
+                "name" to field.name,
+                "type" to shortType(field.type.toString()),
+                "def_pos" to field.defPos,
             )
         }
-        if (result["error"] == null) rememberDecompiled(cls)
-        return result
+        val inners = innerClassesOf(cls)
+        return mapOf(
+            "full_name" to cls.fullName,
+            "name" to cls.name,
+            "method_count" to methods.size,
+            "field_count" to fields.size,
+            "inner_class_count" to inners.size,
+            "methods" to methods,
+            "fields" to fields,
+            "inner_classes" to inners.map { it.fullName },
+        )
     }
 
     /**
@@ -610,6 +590,16 @@ class JadxSession private constructor(
 
     private fun rememberDecompiled(cls: JavaClass) {
         decompileLru.remember(cls)
+    }
+
+    /** Readable `name(Arg, Arg): Ret` signature with package prefixes stripped. */
+    fun methodSignature(method: JavaMethod): String = buildString {
+        append(method.name)
+        append('(')
+        append(method.arguments.joinToString(", ") { shortType(it.toString()) })
+        append(')')
+        append(": ")
+        append(shortType(method.returnType.toString()))
     }
 
     private fun shortType(s: String): String {

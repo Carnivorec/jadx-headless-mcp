@@ -174,7 +174,8 @@ internal fun Server.registerClassTools(holder: SessionHolder) {
         val offset = req.arguments.intArg("offset") ?: 0
         val limit = req.arguments.intArg("limit") ?: 200
         val namesOnly = req.arguments.boolArg("names_only") ?: false
-        val filtered = if (filter == null) cls.fields else cls.fields.filter { it.name.lowercase().contains(filter) }
+        val fields = s.fieldsOf(cls)
+        val filtered = if (filter == null) fields else fields.filter { it.name.lowercase().contains(filter) }
         val page = filtered.asSequence().drop(offset).take(limit).toList()
         okJson(buildJsonObject {
             put("class_name", cls.fullName)

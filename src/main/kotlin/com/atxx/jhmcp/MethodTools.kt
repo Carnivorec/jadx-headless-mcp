@@ -36,19 +36,10 @@ internal fun Server.registerMethodTools(holder: SessionHolder) {
         val offset = req.arguments.intArg("offset") ?: 0
         val limit = req.arguments.intArg("limit") ?: 100
         val namesOnly = req.arguments.boolArg("names_only") ?: false
-        // cls.methods can force full decompile on obfuscated classes — use timed summary path
         val resolvedFqn = cls.fullName
-        val summary = s.summarizeClass(cls)
-        if (summary["error"] != null) {
-            return@addTool errorResult(
-                "list methods timed out or failed for $resolvedFqn: ${summary["error"]}. " +
-                    "Try search_method_by_name or DEX-level tools."
-            )
-        }
-        @Suppress("UNCHECKED_CAST")
-        val all = (summary["methods"] as? List<Map<String, Any>>).orEmpty()
+        val all = s.methodsOf(cls)
         val filtered = if (filter == null) all
-        else all.filter { (it["name"] as? String)?.lowercase()?.contains(filter) == true }
+        else all.filter { it.name.lowercase().contains(filter) }
         val page = filtered.asSequence().drop(offset).take(limit).toList()
         okJson(buildJsonObject {
             put("class_name", resolvedFqn)
@@ -57,14 +48,15 @@ internal fun Server.registerMethodTools(holder: SessionHolder) {
             put("limit", limit)
             put("count", page.size)
             put("items", buildJsonArray {
-                page.forEach { m ->
-                    if (namesOnly) add(m["name"] as String)
+                page.forEach { method ->
+                    if (namesOnly) add(method.name)
                     else addJsonObject {
-                        put("name", m["name"] as String)
-                        put("full_name", "$resolvedFqn.${m["name"]}")
-                        put("signature", m["signature"] as? String ?: "")
-                        put("is_constructor", m["is_constructor"] as? Boolean ?: false)
-                        put("def_pos", (m["def_pos"] as? Number)?.toInt() ?: 0)
+                        put("name", method.name)
+                        put("full_name", "$resolvedFqn.${method.name}")
+                        put("short_id", method.methodNode.methodInfo.shortId)
+                        put("signature", s.methodSignature(method))
+                        put("is_constructor", method.isConstructor)
+                        put("def_pos", method.defPos)
                     }
                 }
             })
