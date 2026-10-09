@@ -19,11 +19,12 @@ class SessionHolder(
 
     fun current(): JadxSession? = session
 
-    suspend fun load(apkPath: String, options: SessionConfig = defaults): LoadResult = mutex.withLock {
+    suspend fun load(apkPath: String, options: SessionConfig = defaults, projectPath: String? = null): LoadResult = mutex.withLock {
         session?.close()
         session = null
         val started = System.currentTimeMillis()
-        val s = JadxSession.open(apkPath, options)
+        val s = JadxSession.open(apkPath, options, projectPath)
+        val codeData = s.codeDataSnapshot()
         val elapsed = System.currentTimeMillis() - started
         loadDurationMs = elapsed
         loadedAt = System.currentTimeMillis()
@@ -40,6 +41,10 @@ class SessionHolder(
             resourceMode = s.resourceMode.name.lowercase(),
             includePackages = s.packageFilter.include,
             excludePackages = s.packageFilter.exclude,
+            projectPath = s.projectPath?.toString(),
+            projectLoaded = s.projectLoaded,
+            renameCount = codeData.renames.size,
+            commentCount = codeData.comments.size,
         )
     }
 
@@ -57,6 +62,7 @@ class SessionHolder(
         return if (s == null) {
             Snapshot(state = "EMPTY")
         } else {
+            val codeData = s.codeDataSnapshot()
             Snapshot(
                 state = "LOADED",
                 apkPath = s.apkPath,
@@ -71,11 +77,19 @@ class SessionHolder(
                 resourceMode = s.resourceMode.name.lowercase(),
                 includePackages = s.packageFilter.include,
                 excludePackages = s.packageFilter.exclude,
+                projectPath = s.projectPath?.toString(),
+                projectLoaded = s.projectLoaded,
+                renameCount = codeData.renames.size,
+                commentCount = codeData.comments.size,
             )
         }
     }
 
     data class LoadResult(
+        val projectPath: String? = null,
+        val projectLoaded: Boolean = false,
+        val renameCount: Int = 0,
+        val commentCount: Int = 0,
         val apkPath: String,
         val classCount: Int,
         val rawClassCount: Int,
@@ -90,6 +104,10 @@ class SessionHolder(
     )
 
     data class Snapshot(
+        val projectPath: String? = null,
+        val projectLoaded: Boolean = false,
+        val renameCount: Int = 0,
+        val commentCount: Int = 0,
         val state: String,
         val apkPath: String? = null,
         val classCount: Int? = null,

@@ -41,6 +41,7 @@ private fun parseArgs(args: Array<String>): Config {
     val excludePackages = mutableListOf<String>()
     var codeCacheSize = SessionConfig.DEFAULT_CODE_CACHE_SIZE
     var resourceMode = ResourceMode.FULL
+    var autoProject = true
     var transport = TransportMode.STDIO
     var host = "127.0.0.1"
     var port = 8080
@@ -50,6 +51,10 @@ private fun parseArgs(args: Array<String>): Config {
     var i = 0
     while (i < args.size) {
         when (args[i]) {
+            "--no-auto-project" -> {
+                autoProject = false
+                i += 1
+            }
             "--apk" -> {
                 require(i + 1 < args.size) { "--apk requires a value" }
                 apkPath = args[i + 1]
@@ -157,6 +162,7 @@ private fun parseArgs(args: Array<String>): Config {
             excludePackages = excludePackages.toList(),
             codeCacheSize = codeCacheSize,
             resourceMode = resourceMode,
+            autoProject = autoProject,
         ),
         transport = transport,
         host = host,
@@ -190,6 +196,8 @@ Transport:
                             reverse proxy only)
 
 Analysis:
+  --no-auto-project        disable the default <input-name>.jadx sidecar; changes stay in memory
+                            until save_project supplies a path (explicit projects still load).
   --apk <path>              optional: APK / DEX / JAR to load eagerly at startup.
                             If omitted, use the 'load_apk' tool to load on demand.
   --max-source-bytes <n>    max bytes per source response (default 60000; per-call max_bytes overrides)
@@ -310,6 +318,7 @@ private fun runHttp(cfg: Config, buildServer: () -> Server) {
 /** Wire up all ~26 MCP tools, grouped by concern into per-topic registration files. */
 private fun registerTools(server: Server, holder: SessionHolder) {
     server.registerSessionTools(holder)
+    server.registerCodeDataTools(holder)
     server.registerManifestTools(holder)
     server.registerClassTools(holder)
     server.registerMethodTools(holder)

@@ -8,10 +8,18 @@ import jadx.api.JavaMethod
 import jadx.api.JavaNode
 import jadx.api.ResourceFile
 import jadx.api.ResourceType
+import jadx.api.data.CommentStyle
+import jadx.api.data.impl.JadxCodeComment
+import jadx.api.data.impl.JadxCodeData
+import jadx.api.data.impl.JadxCodeRename
+import jadx.api.data.impl.JadxNodeRef
+import jadx.core.deobf.NameMapper
+import jadx.core.dex.nodes.ProcessState
 import jadx.core.xmlgen.ResContainer
 import org.slf4j.LoggerFactory
 import java.io.Closeable
 import java.io.File
+import java.nio.file.Path
 import java.util.Collections
 import java.util.concurrent.Callable
 import java.util.concurrent.ExecutionException
@@ -20,7 +28,9 @@ import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
+import java.util.concurrent.locks.ReentrantReadWriteLock
 import java.util.zip.ZipFile
+import kotlin.concurrent.read
 
 class JadxSession private constructor(
     private val decompiler: JadxDecompiler,
@@ -28,7 +38,14 @@ class JadxSession private constructor(
     val options: SessionConfig,
     /** Top-level class count as jadx loaded them, before [PackageFilter]. */
     val rawClassCount: Int,
+    private val inputFiles: List<File>,
+    project: ProjectFile?,
 ) : Closeable {
+    @Volatile
+    var projectPath: Path? = project?.path?.toAbsolutePath()?.normalize()
+        private set
+    val projectLoaded: Boolean = project?.loaded ?: false
+    private val codeData = decompiler.args.codeData as JadxCodeData
     val maxSourceBytes: Int get() = options.maxSourceBytes
     val codeScanCap: Int get() = options.codeScanCap
     val decompileTimeoutMs: Long get() = options.decompileTimeoutMs
@@ -46,6 +63,8 @@ class JadxSession private constructor(
     // a fresh one — otherwise one pathological class would wedge every later request behind a dead
     // worker, turning the whole session into a string of timeouts.
     private val poolLock = Any()
+    // A retired timeout worker can still be inside jadx. Mutations must also wait for it.
+    private val codeDataLock = ReentrantReadWriteLock()
 
     @Volatile
     private var decompilePool: ExecutorService = newDecompilePool()
@@ -55,7 +74,7 @@ class JadxSession private constructor(
             Thread(r, "jhmcp-decompile").apply { isDaemon = true }
         }
 
-    private val decompileLru = DecompileLru(options.codeCacheSize)
+    private var decompileLru = DecompileLru(options.codeCacheSize)
 
     /**
      * Top-level classes visible to tools. When a package filter is active, excluded classes
@@ -83,7 +102,7 @@ class JadxSession private constructor(
     }
 
     /** Cached top-level class FQNs so list_classes / main-app filtering doesn't re-map every call. */
-    val classFqns: List<String> by lazy { classes.map { it.fullName } }
+    val classFqns: List<String> get() = nameIndexes.value.classFqns
 
     /**
      * Every class INCLUDING nested/inner ones. jadx's `decompiler.classes` returns only top-level
@@ -95,37 +114,54 @@ class JadxSession private constructor(
         decompiler.classesWithInners.filter { it.classNode.topParentClass in keptTopClasses }
     }
 
-    private val classByFqn: Map<String, JavaClass> by lazy {
-        allClasses.associateBy { it.fullName }
-    }
+    @Volatile
+    private var nameIndexes = lazy { NameIndexes() }
 
-    /** Keyed on the runtime/raw name (nested classes joined with `$`, e.g. `Outer$Companion`). */
-    private val classByRawName: Map<String, JavaClass> by lazy {
-        allClasses.associateBy { it.rawName }
-    }
+    private val classByFqn get() = nameIndexes.value.classByFqn
+    private val classByRawName get() = nameIndexes.value.classByRawName
+    private val classByOriginalFqn get() = nameIndexes.value.classByOriginalFqn
+    private val classByCanon get() = nameIndexes.value.classByCanon
+    private val methodsByName get() = nameIndexes.value.methodsByName
 
-    /**
-     * Canonical lookup: `$` and `.` nesting separators unified so a caller can address a class
-     * with either `Outer$Inner`, `Outer.Inner`, `Outer$Companion`, or `Outer.Companion`.
-     * Both `fullName` (dotted) and `rawName` (`$`) are indexed; exact indexes are tried first.
-     */
-    private val classByCanon: Map<String, JavaClass> by lazy {
-        val map = HashMap<String, JavaClass>(allClasses.size * 2)
-        for (cls in allClasses) {
-            map[canonicalizeClassName(cls.fullName)] = cls
-            map.putIfAbsent(canonicalizeClassName(cls.rawName), cls)
+    private inner class NameIndexes {
+        val classFqns = classes.map { it.fullName }
+
+        val classByFqn: Map<String, JavaClass> by lazy {
+            allClasses.associateBy { it.fullName }
         }
-        map
-    }
 
-    private val methodsByName: Map<String, List<JavaClass>> by lazy {
-        val map = HashMap<String, MutableList<JavaClass>>(allClasses.size * 4)
-        for (cls in allClasses) {
-            for (name in methodsOf(cls).map { it.name }.distinct()) {
-                map.getOrPut(name) { mutableListOf() }.add(cls)
+        val classByOriginalFqn: Map<String, JavaClass> by lazy {
+            allClasses.associateBy { it.classNode.classInfo.fullName }
+        }
+
+        /** Keyed on the runtime/raw name (nested classes joined with `$`, e.g. `Outer$Companion`). */
+        val classByRawName: Map<String, JavaClass> by lazy {
+            allClasses.associateBy { it.rawName }
+        }
+
+        /**
+         * Canonical lookup: `$` and `.` nesting separators unified so a caller can address a class
+         * with either `Outer$Inner`, `Outer.Inner`, `Outer$Companion`, or `Outer.Companion`.
+         * Both `fullName` (dotted) and `rawName` (`$`) are indexed; exact indexes are tried first.
+         */
+        val classByCanon: Map<String, JavaClass> by lazy {
+            val map = HashMap<String, JavaClass>(allClasses.size * 2)
+            for (cls in allClasses) {
+                map[canonicalizeClassName(cls.fullName)] = cls
+                map.putIfAbsent(canonicalizeClassName(cls.rawName), cls)
             }
+            map
         }
-        map
+
+        val methodsByName: Map<String, List<JavaClass>> by lazy {
+            val map = HashMap<String, MutableList<JavaClass>>(allClasses.size * 4)
+            for (cls in allClasses) {
+                for (name in methodsOf(cls).flatMap { listOf(it.name, it.methodNode.methodInfo.name) }.distinct()) {
+                    map.getOrPut(name) { mutableListOf() }.add(cls)
+                }
+            }
+            map
+        }
     }
 
     fun methodsOf(cls: JavaClass): List<JavaMethod> =
@@ -147,14 +183,16 @@ class JadxSession private constructor(
      * Robust class resolution. In precedence order:
      *  1. exact dotted FQN (`com.foo.Outer.Inner`)
      *  2. exact raw name (`com.foo.Outer$Inner`, `...$Companion`)
-     *  3. canonical match (`$`/`.` nesting unified) — fixes `Outer$Companion` vs `Outer.Companion`
-     *  4. fuzzy suffix: a class whose canonical FQN ends with the (canonical) query — auto-picked only if unique
-     *  5. simple-name match — auto-picked only if unique, otherwise returned as candidates
+     *  3. original dotted FQN (still valid after a user rename)
+     *  4. canonical match (`$`/`.` nesting unified) — fixes `Outer$Companion` vs `Outer.Companion`
+     *  5. fuzzy suffix: a class whose canonical FQN ends with the (canonical) query — auto-picked only if unique
+     *  6. simple-name match — auto-picked only if unique, otherwise returned as candidates
      */
     fun resolveClassDetailed(query: String): ClassResolution {
         val q = query.trim()
         classByFqn[q]?.let { return ClassResolution(it, emptyList()) }
         classByRawName[q]?.let { return ClassResolution(it, emptyList()) }
+        classByOriginalFqn[q]?.let { return ClassResolution(it, emptyList()) }
         val cq = canonicalizeClassName(q).trim('.')
         classByCanon[cq]?.let { return ClassResolution(it, emptyList()) }
         // Tier 1: precise suffix on the whole (canonical) query.
@@ -259,7 +297,6 @@ class JadxSession private constructor(
                 val code = decompileTimed(cls.fullName, "code-search", decompileTimeoutMs.coerceAtMost(20_000L)) {
                     cls.code.orEmpty()
                 }.getOrElse { "" }
-                rememberDecompiled(cls)
                 if (code.isNotEmpty()) {
                     val idx = code.indexOf(term, ignoreCase = true)
                     if (idx >= 0) {
@@ -290,40 +327,162 @@ class JadxSession private constructor(
     fun searchMethods(name: String, limit: Int): List<JavaMethod> {
         val exact = methodsByName[name]
         if (!exact.isNullOrEmpty()) return exact.asSequence()
-            .flatMap { methodsOf(it).asSequence().filter { method -> method.name == name } }
+            .flatMap { methodsOf(it).asSequence().filter { method -> method.matchesName(name) } }
             .take(limit)
             .toList()
         val kw = name.lowercase()
         return methodsByName.entries.asSequence()
             .filter { it.key.lowercase().contains(kw) }
             .flatMap { (methodName, owners) ->
-                owners.asSequence().flatMap { methodsOf(it).asSequence().filter { method -> method.name == methodName } }
+                owners.asSequence().flatMap { methodsOf(it).asSequence().filter { method -> method.matchesName(methodName) } }
             }
+            .distinctBy { JadxNodeRef.forMth(it) }
             .take(limit)
             .toList()
     }
 
     fun findMethod(classFqn: String, methodName: String): JavaMethod? {
         val cls = resolveClass(classFqn) ?: return null
-        return methodsOf(cls).firstOrNull { it.name == methodName }
+        return methodsOf(cls).firstOrNull { it.matchesName(methodName) }
     }
 
     /** All methods matching [methodName] in the class (handles overloads). */
     fun findMethods(classFqn: String, methodName: String): List<JavaMethod> {
         val cls = resolveClass(classFqn) ?: return emptyList()
-        return methodsOf(cls).filter { it.name == methodName }
+        return methodsOf(cls).filter { it.matchesName(methodName) }
     }
 
     fun findField(classFqn: String, fieldName: String): JavaField? {
         val cls = resolveClass(classFqn) ?: return null
-        return fieldsOf(cls).firstOrNull { it.name == fieldName }
+        return fieldsOf(cls).firstOrNull { it.name == fieldName || it.fieldNode.fieldInfo.name == fieldName }
+    }
+
+    private fun JavaMethod.matchesName(name: String): Boolean =
+        this.name == name || methodNode.methodInfo.name == name
+
+    data class CodeDataChange(val oldName: String, val newName: String, val projectSaved: Boolean)
+
+    fun renameClass(cls: JavaClass, newName: String): CodeDataChange = onDecompileWorker {
+        require(newName.isEmpty() || NameMapper.isValidIdentifier(newName) ||
+            (!cls.isInner && (NameMapper.isValidFullIdentifier(newName) ||
+                (newName.startsWith(".") && NameMapper.isValidIdentifier(newName.substring(1)))))) {
+            "Invalid class name '$newName': expected a Java identifier or a full name (top-level classes only)"
+        }
+        val oldName = cls.fullName
+        updateRename(JadxNodeRef.forCls(cls), newName)
+        if (newName.isEmpty()) cls.removeAlias()
+        val saved = refreshCodeData()
+        CodeDataChange(oldName, cls.fullName, saved)
+    }
+
+    fun renameMethod(method: JavaMethod, newName: String): CodeDataChange = onDecompileWorker {
+        // Re-resolve members: an earlier decompile/LRU unload may have replaced their nodes.
+        val ref = JadxNodeRef.forMth(method)
+        val current = methodsOf(method.declaringClass).first { it.methodNode.methodInfo.shortId == ref.shortId }
+        require(current.methodNode.methodInfo.name !in listOf("<init>", "<clinit>")) {
+            "Constructors and <clinit> cannot be renamed"
+        }
+        require(newName.isEmpty() || NameMapper.isValidIdentifier(newName)) { "Invalid method name '$newName': expected a Java identifier" }
+        val oldName = current.name
+        val related = current.overrideRelatedMethods
+        val refs = related.map { JadxNodeRef.forMth(it) }.toSet()
+        codeData.renames = codeData.renames.filterNot { it.codeRef == null && it.nodeRef in refs }
+        updateRename(ref, newName)
+        if (newName.isEmpty()) {
+            current.removeAlias()
+            related.forEach { it.removeAlias() }
+        }
+        val saved = refreshCodeData()
+        CodeDataChange(oldName, current.name, saved)
+    }
+
+    fun renameField(field: JavaField, newName: String): CodeDataChange = onDecompileWorker {
+        require(newName.isEmpty() || NameMapper.isValidIdentifier(newName)) { "Invalid field name '$newName': expected a Java identifier" }
+        val ref = JadxNodeRef.forFld(field)
+        val current = fieldsOf(field.declaringClass).first { it.fieldNode.fieldInfo.shortId == ref.shortId }
+        val oldName = current.name
+        updateRename(ref, newName)
+        if (newName.isEmpty()) current.removeAlias()
+        val saved = refreshCodeData()
+        CodeDataChange(oldName, current.name, saved)
+    }
+
+    fun renamePackage(pkgName: String, newName: String): CodeDataChange = onDecompileWorker {
+        require(newName.isEmpty() || newName.removePrefix(".").split('.').all { NameMapper.isValidIdentifier(it) }) {
+            "Invalid package name '$newName': expected dot-separated Java identifiers, optionally starting with '.'"
+        }
+        val pkg = decompiler.root.packages.firstOrNull { it.pkgInfo.fullName == pkgName }
+            ?: decompiler.root.packages.firstOrNull { it.aliasPkgInfo.fullName == pkgName }
+            ?: throw IllegalArgumentException("Package not found: $pkgName")
+        val oldName = pkg.aliasPkgInfo.fullName
+        updateRename(JadxNodeRef.forPkg(pkg.pkgInfo.fullName), newName)
+        if (newName.isEmpty()) {
+            pkg.removeAlias()
+            pkg.updatePackages()
+        }
+        val saved = refreshCodeData()
+        CodeDataChange(oldName, pkg.aliasPkgInfo.fullName, saved)
+    }
+
+    fun setComment(node: JavaNode, text: String, style: CommentStyle = CommentStyle.LINE): CodeDataChange = onDecompileWorker {
+        val ref = requireNotNull(JadxNodeRef.forJavaNode(node)) { "Comments require a class, method or field" }
+        codeData.comments = codeData.comments.filterNot { it.nodeRef == ref && it.codeRef == null }.toMutableList().apply {
+            if (text.isNotEmpty()) add(JadxCodeComment(ref, null, text, style))
+        }
+        val name = node.fullName
+        CodeDataChange(name, name, refreshCodeData())
+    }
+
+    // Mutations replace the lists wholesale, so a copy is consistent without queueing behind a decompile.
+    fun codeDataSnapshot(): JadxCodeData = ProjectFile.copyCodeData(codeData)
+
+    fun saveProject(path: Path? = null): Path = onDecompileWorker {
+        val target = (path ?: projectPath ?: throw IllegalArgumentException("No project path set; provide path"))
+            .toAbsolutePath().normalize()
+        ProjectFile.write(target, inputFiles.map { it.toPath() }, codeData)
+        projectPath = target
+        target
+    }
+
+    private fun updateRename(ref: JadxNodeRef, newName: String) {
+        codeData.renames = codeData.renames.filterNot { it.nodeRef == ref && it.codeRef == null }.toMutableList().apply {
+            if (newName.isNotEmpty()) add(JadxCodeRename(ref, newName))
+        }
+    }
+
+    /** Runs only on the decompile worker, including refresh of previously materialized callers. */
+    private fun refreshCodeData(): Boolean {
+        decompiler.reloadCodeData()
+        decompiler.classes.filter { it.classNode.state != ProcessState.NOT_LOADED }.forEach { it.unload() }
+        decompileLru = DecompileLru(codeCacheSize)
+        nameIndexes = lazy { NameIndexes() }
+        val path = projectPath ?: return false
+        ProjectFile.write(path, inputFiles.map { it.toPath() }, codeData)
+        return true
+    }
+
+    private fun <T> onDecompileWorker(block: () -> T): T {
+        return try {
+            decompilePool.submit(Callable {
+                val lock = codeDataLock.writeLock()
+                check(lock.tryLock(decompileTimeoutMs, TimeUnit.MILLISECONDS)) {
+                    "A timed-out decompile is still running inside jadx; retry the change later"
+                }
+                try {
+                    block()
+                } finally {
+                    lock.unlock()
+                }
+            }).get()
+        } catch (e: ExecutionException) {
+            throw e.cause ?: e
+        }
     }
 
     fun getClassSource(cls: JavaClass, maxBytes: Int = maxSourceBytes): String {
         val text = decompileTimed(cls.fullName, "source", decompileTimeoutMs) {
             cls.code.orEmpty()
         }.getOrElse { err -> return decompileErrorBanner(cls, "source", err) }
-        rememberDecompiled(cls)
         return truncateToBytes(text, maxBytes)
     }
 
@@ -331,7 +490,6 @@ class JadxSession private constructor(
         val text = decompileTimed(cls.fullName, "smali", decompileTimeoutMs) {
             cls.smali.orEmpty()
         }.getOrElse { err -> return decompileErrorBanner(cls, "smali", err) }
-        rememberDecompiled(cls)
         return truncateToBytes(text, maxBytes)
     }
 
@@ -345,7 +503,6 @@ class JadxSession private constructor(
         }.getOrElse { err ->
             return "// ERROR: decompile timed out or failed for ${method.fullName}: ${err.message}"
         }
-        method.declaringClass?.let { rememberDecompiled(it) }
         return text
     }
 
@@ -369,13 +526,11 @@ class JadxSession private constructor(
         val java = decompileTimed(cls.fullName, "source", decompileTimeoutMs) {
             cls.code.orEmpty()
         }.getOrElse { err -> return SmartCode(decompileErrorBanner(cls, "source", err), "java", false, emptyList()) }
-        rememberDecompiled(cls)
         val markers = detectDecompileFailure(java)
         if (smaliFallback && markers.any { it in STRONG_FAILURE_MARKERS }) {
             val smali = decompileTimed(cls.fullName, "smali", decompileTimeoutMs) {
                 cls.smali.orEmpty()
             }.getOrElse { err -> return SmartCode(decompileErrorBanner(cls, "smali", err), "smali", true, markers) }
-            rememberDecompiled(cls)
             return SmartCode(truncateToBytes(smaliFallbackHeader(cls.fullName, markers) + smali, maxBytes), "smali", true, markers)
         }
         return SmartCode(truncateToBytes(java, maxBytes), "java", false, markers)
@@ -427,7 +582,6 @@ class JadxSession private constructor(
         }.getOrElse { err ->
             return MethodSmali(methodName, emptyList(), false, "smali generation failed: ${err.message}")
         }
-        rememberDecompiled(cls)
         if (smali.isEmpty()) return MethodSmali(methodName, emptyList(), false, "class has no smali (no code)")
         val blocks = extractMethodBlocks(smali, methodName)
         return MethodSmali(methodName, blocks, blocks.isNotEmpty())
@@ -438,7 +592,6 @@ class JadxSession private constructor(
         val smali = decompileTimed(cls.fullName, "smali", decompileTimeoutMs) {
             cls.smali.orEmpty()
         }.getOrElse { err -> return Triple(decompileErrorBanner(cls, "smali", err), 0, 0) }
-        rememberDecompiled(cls)
         val total = smali.length
         if (offset >= total) return Triple("", total, total)
         val from = offset.coerceIn(0, total)
@@ -463,7 +616,13 @@ class JadxSession private constructor(
         val started = System.currentTimeMillis()
         val pool = decompilePool
         val future = try {
-            pool.submit(Callable { block() })
+            pool.submit(Callable {
+                codeDataLock.read {
+                    val value = block()
+                    resolveClass(classFqn)?.let { decompileLru.remember(it) }
+                    value
+                }
+            })
         } catch (re: RejectedExecutionException) {
             // Pool was retired concurrently (a sibling call timed out and rebuilt it). Transient.
             return Result.failure(re)
@@ -560,9 +719,9 @@ class JadxSession private constructor(
         val topCls = runCatching { node.topParentClass }.getOrNull()
         val defPos = runCatching { node.defPos }.getOrNull() ?: 0
         val line = if (resolveLine && topCls != null && defPos > 0) {
-            val n = runCatching { topCls.getSourceLine(defPos) }.getOrNull() ?: 0
-            rememberDecompiled(topCls)
-            n
+            decompileTimed(topCls.fullName, "xref-line", decompileTimeoutMs) {
+                topCls.getSourceLine(defPos)
+            }.getOrDefault(0)
         } else 0
         val out = mutableMapOf<String, Any>(
             "kind" to kind,
@@ -586,10 +745,6 @@ class JadxSession private constructor(
         } ?: return null
         val container = runCatching { res.loadContent() }.getOrNull() ?: return null
         return if (container.dataType == ResContainer.DataType.TEXT) container.text.codeStr else null
-    }
-
-    private fun rememberDecompiled(cls: JavaClass) {
-        decompileLru.remember(cls)
     }
 
     /** Readable `name(Arg, Arg): Ret` signature with package prefixes stripped. */
@@ -626,17 +781,41 @@ class JadxSession private constructor(
         fun open(
             apkPath: String,
             options: SessionConfig = SessionConfig(),
+            projectPath: String? = null,
         ): JadxSession {
             val file = File(apkPath)
-            require(file.exists()) { "APK not found: $apkPath" }
-            require(file.isFile) { "Not a regular file: $apkPath" }
+            if (file.extension.equals("jadx", ignoreCase = true)) {
+                val project = ProjectFile.read(file.toPath())
+                return open(project.files.map { it.toFile() }, options, project)
+            }
+            val path = projectPath?.let { Path.of(it) } ?: if (options.autoProject) {
+                file.absoluteFile.parentFile.resolve("${file.nameWithoutExtension}.jadx").toPath()
+            } else null
+            val project = path?.let {
+                if (it.toFile().exists()) ProjectFile.read(it)
+                else ProjectFile(listOf(file.toPath()), JadxCodeData(), it)
+            }
+            return open(listOf(file), options, project)
+        }
+
+        fun open(
+            files: List<File>,
+            options: SessionConfig = SessionConfig(),
+            project: ProjectFile? = null,
+        ): JadxSession {
+            val apkPath = files.first().path
+            files.forEach { file ->
+                require(file.exists()) { "APK not found: $file" }
+                require(file.isFile) { "Not a regular file: $file" }
+            }
 
             // jadx-xapk-input only recognizes XAPKs with manifest.json (APKPure layout).
             // Split-APK bundles without manifest.json fall through to the default zip
             // handler and yield ~0 classes — pre-extract the base APK so JADX sees a real APK.
-            val effectiveFile = if (file.name.endsWith(".xapk", ignoreCase = true)) {
-                extractXapkBaseIfNoManifest(file) ?: file
-            } else file
+            val effectiveFiles = files.map { file ->
+                if (file.name.endsWith(".xapk", ignoreCase = true)) extractXapkBaseIfNoManifest(file) ?: file
+                else file
+            }
 
             val outDir = File(System.getProperty("java.io.tmpdir"), "jhmcp-${System.nanoTime()}")
             outDir.mkdirs()
@@ -644,7 +823,8 @@ class JadxSession private constructor(
 
             val threads = options.resolvedThreads()
             val args = JadxArgs().apply {
-                inputFiles.add(effectiveFile)
+                inputFiles.addAll(effectiveFiles)
+                codeData = project?.codeData ?: JadxCodeData()
                 setOutDir(outDir)
                 isShowInconsistentCode = true
                 threadsCount = threads
@@ -660,8 +840,10 @@ class JadxSession private constructor(
 
             val started = System.currentTimeMillis()
             System.err.println("[jhmcp] loading APK: $apkPath (threads=$threads resources=${options.resourceMode.name.lowercase()})")
-            if (effectiveFile !== file) {
-                System.err.println("[jhmcp] XAPK has no manifest.json; extracted base APK: ${effectiveFile.name}")
+            files.zip(effectiveFiles).forEach { (file, effectiveFile) ->
+                if (effectiveFile !== file) {
+                    System.err.println("[jhmcp] XAPK has no manifest.json; extracted base APK: ${effectiveFile.name}")
+                }
             }
             val decompiler = JadxDecompiler(args)
             decompiler.load()
@@ -676,7 +858,7 @@ class JadxSession private constructor(
                 )
             }
 
-            return JadxSession(decompiler, apkPath, options, rawCount)
+            return JadxSession(decompiler, apkPath, options, rawCount, files, project)
         }
 
         internal fun isManifestResource(res: ResourceFile): Boolean {

@@ -18,6 +18,7 @@ data class SessionConfig(
     val excludePackages: List<String> = emptyList(),
     val codeCacheSize: Int = DEFAULT_CODE_CACHE_SIZE,
     val resourceMode: ResourceMode = ResourceMode.FULL,
+    val autoProject: Boolean = true,
 ) {
     val packageFilter: PackageFilter
         get() = PackageFilter(include = includePackages, exclude = excludePackages)

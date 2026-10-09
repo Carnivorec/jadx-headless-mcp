@@ -18,7 +18,7 @@ So this server drops the GUI and exposes `jadx-core` as ~26 MCP tools over stdio
 | Tool | Description |
 |---|---|
 | `status` | Whether an APK is loaded; path, class/resource counts, load duration |
-| `load_apk` | Load an APK / DEX / JAR (replaces any current one) |
+| `load_apk` | Load an APK / DEX / JAR or .jadx project; optional `project` path (replaces the current session) |
 | `unload_apk` | Release the loaded APK and free memory |
 
 ### Static analysis (require a loaded APK)
@@ -46,6 +46,26 @@ So this server drops the GUI and exposes `jadx-core` as ~26 MCP tools over stdio
 | `get_strings` | String resources with optional filter |
 | `list_resource_files` | Resource file names |
 | `get_resource_file` | Resource file content (text or base64) |
+
+### Renames and comments (require a loaded APK)
+
+| Tool | Description |
+|---|---|
+| `rename_class` | Rename a class; top-level classes also accept a full name |
+| `rename_method` | Rename a method; `short_id` selects an overload |
+| `rename_field` | Rename a field |
+| `rename_package` | Rename a package by its original or current full name |
+| `set_comment` | Set a declaration comment on a class, method or field |
+| `get_code_data` | List user renames, comments and the current project path |
+| `save_project` | Save a .jadx project; optional `path` becomes the destination for later changes |
+
+## Renames, comments & .jadx projects
+
+`load_apk` reads the adjacent `<input-name-without-extension>.jadx` by default. Supply `project` to select another project, or use a `.jadx` as `path` to load all of its input files (relative paths resolve against the project directory). With an explicit APK path, the project's stored input list is ignored. Loading does not write a project; renames and comments save automatically when a project path is set. `status` and `load_apk` report `project_path`, `project_loaded`, `rename_count` and `comment_count`.
+
+Use `--no-auto-project` to disable the default sidecar. Changes then stay in memory until `save_project` receives a `path`; explicitly selected projects still work. Saved files use jadx-gui's project version 2 format, preserve existing GUI settings such as open tabs, and can be opened in jadx-gui. GUI renames and comments are read when the project is loaded again here.
+
+Renames apply to later source and metadata outputs, including previously decompiled callers; original names remain valid lookup inputs. Pass an empty `new_name` to reset a rename. `rename_method` requires `short_id` for overloaded names and does not rename constructors or `<clinit>`. `set_comment` targets the class unless `method_name` (and `short_id` for overloads) or `field_name` is supplied; empty `comment` removes it. Styles are `line` (default), `block`, `block_condensed`, `javadoc` and `javadoc_condensed`.
 
 ## Build
 

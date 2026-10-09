@@ -28,6 +28,9 @@ dependencies {
     implementation("io.github.skylot:jadx-raung-input:$jadxVersion")
     implementation("io.github.skylot:jadx-xapk-input:$jadxVersion")
     implementation("io.github.skylot:jadx-kotlin-metadata:$jadxVersion")
+    // .jadx project files use jadx's own Gson setup; jadx-core only exposes Gson at runtime.
+    // Keep in step with the version jadx-core resolves to.
+    implementation("com.google.code.gson:gson:2.14.0")
 
     implementation("io.modelcontextprotocol:kotlin-sdk:$mcpKotlinSdkVersion")
 

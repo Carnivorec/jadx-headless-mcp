@@ -19,6 +19,10 @@ internal fun Server.registerSessionTools(holder: SessionHolder) {
         val snap = holder.snapshot()
         okJson(buildJsonObject {
             put("state", snap.state)
+            snap.projectPath?.let { put("project_path", it) }
+            put("project_loaded", snap.projectLoaded)
+            put("rename_count", snap.renameCount)
+            put("comment_count", snap.commentCount)
             snap.apkPath?.let { put("apk_path", it) }
             snap.classCount?.let { put("class_count", it) }
             snap.rawClassCount?.let { put("raw_class_count", it) }
@@ -40,10 +44,11 @@ internal fun Server.registerSessionTools(holder: SessionHolder) {
 
     addTool(
         name = "load_apk",
-        description = "Load an APK / DEX / JAR. Replaces any currently-loaded file. Blocks until indexing completes (typically a few seconds to a minute depending on size). Optional include_packages/exclude_packages, threads, code_cache_size, resources (full|lite|none) override the server CLI defaults for this load.",
+        description = "Load an APK / DEX / JAR or a .jadx project, replacing the current session and indexing its inputs. Reads renames/comments from the explicit project or default .jadx sidecar; include_packages/exclude_packages, threads, code_cache_size and resources override CLI defaults.",
         inputSchema = ToolSchema(
             properties = buildJsonObject {
-                putJsonObject("path") { put("type", "string"); put("description", "Absolute path to the APK / DEX / JAR.") }
+                putJsonObject("path") { put("type", "string"); put("description", "Absolute path to the APK / DEX / JAR or .jadx project.") }
+                putJsonObject("project") { put("type", "string"); put("description", "Optional .jadx path; with an explicit APK only its codeData is loaded. Defaults to <input-name>.jadx unless --no-auto-project is set.") }
                 putJsonObject("include_packages") {
                     put("type", "string")
                     put("description", "Comma-separated package/FQN prefixes to KEEP (e.g. com.gcash,com.mynt). Overrides CLI --include-packages for this load.")
@@ -80,10 +85,14 @@ internal fun Server.registerSessionTools(holder: SessionHolder) {
         } catch (e: IllegalArgumentException) {
             return@addTool errorResult(e.message ?: "invalid load options")
         }
-        runCatching { holder.load(path, options) }.fold(
+        runCatching { holder.load(path, options, req.arguments.strArg("project")) }.fold(
             onSuccess = { r ->
                 okJson(buildJsonObject {
                     put("state", "LOADED")
+                    r.projectPath?.let { put("project_path", it) }
+                    put("project_loaded", r.projectLoaded)
+                    put("rename_count", r.renameCount)
+                    put("comment_count", r.commentCount)
                     put("apk_path", r.apkPath)
                     put("class_count", r.classCount)
                     put("raw_class_count", r.rawClassCount)

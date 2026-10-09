@@ -18,7 +18,7 @@ jadx 由两部分组成：`jadx-core` 反编译引擎，和包在外面给人手
 | 工具 | 说明 |
 |---|---|
 | `status` | 当前是否已加载 APK；返回路径、类数、资源数、加载耗时 |
-| `load_apk` | 加载 APK / DEX / JAR（替换当前已加载的） |
+| `load_apk` | 加载 APK / DEX / JAR 或 .jadx 项目，可用 `project` 指定项目路径（替换当前会话） |
 | `unload_apk` | 释放当前 APK 并回收内存 |
 
 ### 静态分析（需要先加载 APK）
@@ -41,6 +41,26 @@ jadx 由两部分组成：`jadx-core` 反编译引擎，和包在外面给人手
 | `get_strings` | 字符串资源（可按子串过滤） |
 | `list_resource_files` | 所有资源文件名 |
 | `get_resource_file` | 资源文件内容（文本或 base64） |
+
+### 重命名与注释（需要先加载 APK）
+
+| 工具 | 说明 |
+|---|---|
+| `rename_class` | 重命名类；顶层类也支持完整类名 |
+| `rename_method` | 重命名方法；重载时用 `short_id` 指定目标 |
+| `rename_field` | 重命名字段 |
+| `rename_package` | 按原始或当前完整包名重命名包 |
+| `set_comment` | 设置类、方法或字段的声明注释 |
+| `get_code_data` | 列出用户重命名、注释和当前项目路径 |
+| `save_project` | 保存 .jadx 项目；可选 `path` 成为后续修改的保存位置 |
+
+## 重命名、注释与 .jadx 项目
+
+`load_apk` 默认读取输入文件同目录下的 `<输入文件名去扩展名>.jadx`。可通过 `project` 指定其他项目，也可直接将 `.jadx` 作为 `path`，加载项目中的全部输入文件；相对路径以项目目录为基准。明确传入 APK 路径时，仅读取项目的代码数据，忽略项目内记录的输入列表。加载本身不写文件；设有项目路径时，重命名和注释修改会自动保存。`status` 和 `load_apk` 返回 `project_path`、`project_loaded`、`rename_count`、`comment_count`。
+
+`--no-auto-project` 禁用默认旁置项目，此时修改保留在内存中，直到使用带 `path` 的 `save_project` 保存；显式指定项目仍然有效。保存格式兼容 jadx-gui 的 projectVersion 2，保留已有的标签页等 GUI 设置。人工可在 jadx-gui 中继续查看、编辑，重新加载项目后，MCP 也能读取 GUI 保存的重命名和注释。
+
+重命名会反映到后续源码及元数据输出，包括此前已反编译的调用方；原始名称仍可用于查找。空 `new_name` 重置名称。`rename_method` 遇到重载必须提供 `short_id`，不支持重命名构造器或 `<clinit>`。`set_comment` 默认注释类，也可指定 `method_name`（重载时加 `short_id`）或 `field_name`；空 `comment` 删除注释。支持 `line`（默认）、`block`、`block_condensed`、`javadoc`、`javadoc_condensed` 五种样式。
 
 ## 构建
 
