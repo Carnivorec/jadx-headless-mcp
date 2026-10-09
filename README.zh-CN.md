@@ -2,6 +2,8 @@
 
 [English](README.md) | **简体中文**
 
+> **Fork 说明：**本仓库 fork 自 [1013503897/jadx-headless-mcp](https://github.com/1013503897/jadx-headless-mcp)，新增：类查找改为只读元数据（修复上游 #39：首次查类不再反编译整个 APK）；重命名与声明注释，并保存为与 jadx-gui 兼容的 `.jadx` 项目；后台导出全部源码（`export_sources`）。
+
 直接基于 `jadx-core` 构建的 headless MCP 服务器，用于 Android APK 静态分析。无需 JADX GUI、无需 Python 适配器、无需安装插件 —— 单个 JVM 进程通过 stdio 跑 MCP 协议。
 
 ## 为什么做这个
@@ -273,6 +275,9 @@ Claude Code  ──stdio | Streamable-HTTP JSON-RPC──>  jadx-headless-mcp (J
 ```bash
 JAVA_OPTS="-Xmx8g" ./bin/jadx-headless-mcp
 ```
+
+`java -jar` 方式只有 JVM 默认的物理内存 25% 上限，建议显式指定：`java -Xmx6G -jar jadx-headless-mcp-<version>-all.jar`。
+实测（约 1.8 万个类、20 MB 的 APK）：日常浏览（摘要、源码、交叉引用、代码搜索）峰值 RSS 约 1.9 GB；带资源的完整 `export_sources` 在 `-Xmx6G` 下 75 秒完成（峰值 RSS 4.5 GB），`-Xmx3G` 下 104 秒完成（峰值 RSS 3.4 GB），因为导出过的类写盘后会立即卸载。
 
 ## 上游跟踪
 

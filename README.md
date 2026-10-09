@@ -2,6 +2,8 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
+> **Fork note:** this fork of [1013503897/jadx-headless-mcp](https://github.com/1013503897/jadx-headless-mcp) adds metadata-only class lookup (fix for upstream #39: the first lookup no longer decompiles the whole APK), renames / declaration comments saved to jadx-gui compatible `.jadx` projects, and background source export (`export_sources`).
+
 Headless MCP server for Android APK static analysis, built directly on `jadx-core`. No JADX GUI required, no Python adapter, no plugin to install — just one JVM process speaking MCP over stdio.
 
 ## Why
@@ -286,6 +288,9 @@ The launcher sets `-XX:MaxRAMPercentage=60.0` by default. Override via `JAVA_OPT
 ```bash
 JAVA_OPTS="-Xmx8g" ./bin/jadx-headless-mcp
 ```
+
+`java -jar` gets the JVM default (25% of RAM) instead, so pass a cap explicitly: `java -Xmx6G -jar jadx-headless-mcp-<version>-all.jar`.
+Measured on an 18k-class / 20 MB APK: interactive browsing (summaries, sources, xrefs, code search) peaked at 1.9 GB RSS; a full `export_sources` with resources finishes in 75 s at `-Xmx6G` (peak RSS 4.5 GB) and in 104 s at `-Xmx3G` (peak RSS 3.4 GB), because exported classes are unloaded as they are written.
 
 ## Upstream tracking
 

@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "com.atxx"
-version = "0.7.1"
+version = "0.8.0-fork.1"
 
 repositories {
     mavenCentral()
