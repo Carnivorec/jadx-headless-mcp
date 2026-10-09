@@ -28,6 +28,8 @@ jadx 由两部分组成：`jadx-core` 反编译引擎，和包在外面给人手
 | `get_android_manifest` | 完整的解码后 AndroidManifest.xml |
 | `get_main_activity_class` | LAUNCHER Activity 的 FQN |
 | `list_classes` | 分页的类 FQN 列表 |
+| `export_sources` | 后台导出 Java 源码到绝对路径 `out_dir`，支持按当前别名/包名前缀筛选及导出资源 |
+| `export_status` | 查询导出进度，可等待完成或取消正在运行的导出任务 |
 | `search_classes_by_keyword` | 按 FQN 子串搜索类 |
 | `get_class_source` | 反编译的 Java 源码 |
 | `get_smali_of_class` | smali 反汇编 |
@@ -53,6 +55,10 @@ jadx 由两部分组成：`jadx-core` 反编译引擎，和包在外面给人手
 | `set_comment` | 设置类、方法或字段的声明注释 |
 | `get_code_data` | 列出用户重命名、注释和当前项目路径 |
 | `save_project` | 保存 .jadx 项目；可选 `path` 成为后续修改的保存位置 |
+
+## 导出源码
+
+调用 `export_sources` 并提供绝对路径 `out_dir` 即可启动后台任务，等待至多 `wait_seconds` 秒后返回进度（默认 30 秒，上限 300 秒）；可选 `package` 按当前类的别名前缀筛选，匹配规则与 `list_classes` 相同。使用 `export_status` 轮询至完成（默认等待 0 秒，上限 300 秒），或传入 `cancel=true` 取消任务；每个会话同时只允许一个导出任务。UTF-8 Java 源码保存在 `sources/` 下，内部类保留在外部类文件中；启用 `include_resources=true` 时，会话当前可见的资源另外保存在 `resources/` 下。
 
 ## 重命名、注释与 .jadx 项目
 

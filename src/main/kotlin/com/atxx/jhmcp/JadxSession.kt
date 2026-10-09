@@ -66,6 +66,8 @@ class JadxSession private constructor(
     // A retired timeout worker can still be inside jadx. Mutations must also wait for it.
     private val codeDataLock = ReentrantReadWriteLock()
 
+    internal val sourceExporter = SourceExporter(this, decompiler, codeDataLock)
+
     @Volatile
     private var decompilePool: ExecutorService = newDecompilePool()
 
@@ -769,6 +771,7 @@ class JadxSession private constructor(
     }
 
     override fun close() {
+        sourceExporter.cancel()
         runCatching { decompilePool.shutdownNow() }
         runCatching { decompiler.close() }
     }

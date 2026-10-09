@@ -28,6 +28,8 @@ So this server drops the GUI and exposes `jadx-core` as ~26 MCP tools over stdio
 | `get_android_manifest` | Full decoded AndroidManifest.xml |
 | `get_main_activity_class` | LAUNCHER activity FQN |
 | `list_classes` | Paginated class FQN list |
+| `export_sources` | Start a background Java source export to an absolute `out_dir`, with optional alias/package prefix and resources |
+| `export_status` | Read export progress, optionally wait for completion or cancel the running export |
 | `search_classes_by_keyword` | Substring search over class FQNs |
 | `get_class_source` | Decompiled Java source. Auto-falls back to smali when jadx hits anti-decompile stubs (marker `// [jadx java-decompile failed → smali]`; `smali_fallback=false` to opt out). Resolves inner/`$Companion` names. |
 | `get_class_summary` | Class skeleton (method signatures, fields, inner-class names) — no method bodies |
@@ -58,6 +60,10 @@ So this server drops the GUI and exposes `jadx-core` as ~26 MCP tools over stdio
 | `set_comment` | Set a declaration comment on a class, method or field |
 | `get_code_data` | List user renames, comments and the current project path |
 | `save_project` | Save a .jadx project; optional `path` becomes the destination for later changes |
+
+## Export sources
+
+Call `export_sources` with an absolute `out_dir`; the background job waits up to `wait_seconds` (default 30, capped at 300) before returning progress, and optional `package` filters current class aliases using the same prefix matching as `list_classes`. Poll `export_status` (default wait 0, capped at 300) until the job finishes, or pass `cancel=true` to cancel it; only one export runs per session. UTF-8 Java files go under `sources/` (inner classes stay in their outer class's file), and `include_resources=true` also saves the session's visible resources under `resources/`.
 
 ## Renames, comments & .jadx projects
 

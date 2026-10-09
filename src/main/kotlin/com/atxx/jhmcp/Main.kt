@@ -319,6 +319,7 @@ private fun runHttp(cfg: Config, buildServer: () -> Server) {
 private fun registerTools(server: Server, holder: SessionHolder) {
     server.registerSessionTools(holder)
     server.registerCodeDataTools(holder)
+    server.registerExportTools(holder)
     server.registerManifestTools(holder)
     server.registerClassTools(holder)
     server.registerMethodTools(holder)
